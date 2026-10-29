@@ -1,0 +1,164 @@
+---
+- name: Собрать факты об оборудовании
+  ansible.builtin.setup:
+    gather_subset:
+      - hardware
+
+- name: Проверить точку монтирования
+  ansible.builtin.stat:
+    path: "{{ mount_point }}"
+  register: mount_point_stat
+
+- name: Прервать выполнение, если каталог уже существует
+  ansible.builtin.fail:
+    msg: "Ошибка: каталог {{ mount_point }} уже существует. Защита от повторного запуска."
+  when: mount_point_stat.stat.exists
+
+- name: Установить системные пакеты
+  ansible.builtin.package:
+    name:
+      - lvm2
+      - parted
+      - xfsprogs
+    state: present
+
+- name: Инициализировать список свободных дисков
+  ansible.builtin.set_fact:
+    free_disks: []
+
+- name: Найти свободные физические диски без разделов
+  ansible.builtin.set_fact:
+    free_disks: "{{ free_disks + [item.key] }}"
+  loop: "{{ ansible_facts.devices | dict2items }}"
+  when:
+    - item.key is match('^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+)$')
+    - item.value.partitions | default({}) | length == 0
+    - item.value.holders | default([]) | length == 0
+    - item.value.removable | default('0') | string == '0'
+    - item.value.sectors | default('0') | int > 0
+
+- name: Проверить, что найден ровно один подходящий диск
+  ansible.builtin.fail:
+    msg: >-
+      Ошибка: ожидался 1 чистый диск, найдено: {{ free_disks | length }}.
+      Кандидаты: {{ free_disks | join(', ') if free_disks | length > 0 else 'нет' }}.
+  when: free_disks | length != 1
+
+- name: Определить имена диска и раздела
+  ansible.builtin.set_fact:
+    disk: "/dev/{{ free_disks[0] }}"
+    part: "/dev/{{ free_disks[0] }}{{ 'p' if free_disks[0] is match('.*\\d$') else '' }}1"
+
+- name: Очистить старые сигнатуры на выбранном диске
+  ansible.builtin.command:
+    argv:
+      - wipefs
+      - --all
+      - --force
+      - "{{ disk }}"
+  register: wipe_disk_signatures
+  changed_when: wipe_disk_signatures.stdout | length > 0 or wipe_disk_signatures.stderr | length > 0
+
+- name: Создать GPT-разметку и первый LVM-раздел
+  community.general.parted:
+    device: "{{ disk }}"
+    label: gpt
+    number: 1
+    part_start: 1MiB
+    part_end: 100%
+    flags:
+      - lvm
+    state: present
+
+- name: Обновить таблицу разделов в ядре
+  ansible.builtin.command:
+    argv:
+      - partprobe
+      - "{{ disk }}"
+  changed_when: false
+
+- name: Дождаться обработки udev-событий
+  ansible.builtin.command:
+    argv:
+      - udevadm
+      - settle
+  changed_when: false
+
+- name: Дождаться появления раздела
+  ansible.builtin.wait_for:
+    path: "{{ part }}"
+    timeout: 15
+
+- name: Очистить старые сигнатуры на новом разделе
+  ansible.builtin.command:
+    argv:
+      - wipefs
+      - --all
+      - --force
+      - "{{ part }}"
+  register: wipe_part_signatures
+  changed_when: wipe_part_signatures.stdout | length > 0 or wipe_part_signatures.stderr | length > 0
+
+- name: Дождаться обработки udev-событий после очистки раздела
+  ansible.builtin.command:
+    argv:
+      - udevadm
+      - settle
+  changed_when: false
+
+- name: Проверить, что новый раздел не смонтирован
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --source
+      - "{{ part }}"
+  register: part_mount_check
+  changed_when: false
+  failed_when: part_mount_check.rc == 0
+
+- name: Обновить кэш LVM после очистки раздела
+  ansible.builtin.command:
+    argv:
+      - pvscan
+      - --cache
+      - "{{ part }}"
+  changed_when: false
+  failed_when: false
+
+- name: Создать Volume Group vg_data
+  community.general.lvg:
+    vg: vg_data
+    pvs: "{{ part }}"
+    pv_options: "--force --yes"
+    pvresize: true
+    state: present
+
+- name: Создать Logical Volume lv_data
+  community.general.lvol:
+    vg: vg_data
+    lv: lv_data
+    size: 100%FREE
+    shrink: false
+    state: present
+
+- name: Создать файловую систему XFS
+  community.general.filesystem:
+    fstype: xfs
+    dev: /dev/vg_data/lv_data
+
+- name: Создать точку монтирования
+  ansible.builtin.file:
+    path: "{{ mount_point }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Смонтировать logical volume
+  ansible.posix.mount:
+    path: "{{ mount_point }}"
+    src: /dev/vg_data/lv_data
+    fstype: xfs
+    opts: defaults
+    state: mounted
