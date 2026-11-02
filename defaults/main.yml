@@ -1,0 +1,8 @@
+---
+mount_point: /data
+create_disk_vg_base: vg_data
+create_disk_lv_base: lv_data
+# Optional explicit device, especially useful when several empty disks exist.
+create_disk_device: ""
+# Destructive opt-in for stale signatures on an otherwise unused disk.
+create_disk_wipe_signatures: false

@@ -1,0 +1,35 @@
+---
+- name: Reset disk candidates
+  ansible.builtin.set_fact:
+    create_disk_candidates: []
+
+- name: Filter unused writable whole disks
+  ansible.builtin.set_fact:
+    create_disk_candidates: "{{ create_disk_candidates + [item.name] }}"
+  vars:
+    create_disk_fact: "{{ ansible_facts.devices[item.name | basename] | default({}) }}"
+  loop: "{{ (create_disk_lsblk.stdout | from_json).blockdevices }}"
+  when:
+    - item.name is match('^/dev/(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+)$')
+    - item.type == 'disk'
+    - not (item.ro | bool)
+    - item.children | default([]) | length == 0
+    - item.mountpoints | default([]) | reject('equalto', none) | list | length == 0
+    - create_disk_fact.partitions | default({}) | length == 0
+    - create_disk_fact.holders | default([]) | length == 0
+    - create_disk_fact.removable | default('1') | string == '0'
+    - create_disk_fact.sectors | default('0') | int > 0
+    - item.name not in create_disk_existing_pvs
+    - create_disk_device == '' or item.name == create_disk_device
+
+- name: Require exactly one candidate
+  ansible.builtin.assert:
+    that: create_disk_candidates | length == 1
+    fail_msg: >-
+      Expected exactly one unused disk; found {{ create_disk_candidates }}.
+      An explicit create_disk_device must also pass all safety checks.
+
+- name: Set device and partition paths
+  ansible.builtin.set_fact:
+    create_disk_selected_device: "{{ create_disk_candidates[0] }}"
+    create_disk_selected_partition: "{{ create_disk_candidates[0] }}{{ 'p' if create_disk_candidates[0] is search('[0-9]$') else '' }}1"

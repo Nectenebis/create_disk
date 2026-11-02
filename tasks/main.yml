@@ -1,0 +1,106 @@
+---
+- name: Validate role parameters
+  ansible.builtin.assert:
+    that:
+      - mount_point is string
+      - mount_point is match('^/[^/].*')
+      - "'..' not in mount_point.split('/')"
+      - create_disk_vg_base is match('^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,99}$')
+      - create_disk_lv_base is match('^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,99}$')
+      - create_disk_vg_base not in ['.', '..']
+      - create_disk_lv_base is not match('^(snapshot|pvmove)')
+      - not create_disk_lv_base.endswith('_pmspare')
+      - "not (create_disk_lv_base is search('_(mlog|mimage|rimage|rmeta|tdata|tmeta|cdata|cmeta|vorigin)'))"
+      - create_disk_wipe_signatures is boolean
+      - create_disk_device is string
+    fail_msg: Invalid mount point, LVM base name or role option.
+
+- name: Check destination before changing the server
+  ansible.builtin.stat:
+    path: "{{ mount_point }}"
+    follow: false
+  register: create_disk_mount_stat
+
+- name: Refuse an existing destination (including symlinks)
+  ansible.builtin.assert:
+    that: not create_disk_mount_stat.stat.exists
+    fail_msg: "Destination {{ mount_point }} already exists; use a new path for a new disk."
+
+- name: Refuse check mode before any provisioning
+  ansible.builtin.assert:
+    that: not ansible_check_mode
+    fail_msg: Disk provisioning does not support check mode; no changes have been made.
+
+- name: Gather fresh platform and device facts
+  ansible.builtin.setup:
+    gather_subset: ['!all', min, hardware]
+
+- name: Require a supported Linux package family
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.system == 'Linux'
+      - ansible_facts.os_family in ['Debian', 'RedHat']
+    fail_msg: This role requires a Debian or Red Hat family Linux target.
+
+- name: Install target prerequisites
+  ansible.builtin.package:
+    name:
+      - lvm2
+      - parted
+      - xfsprogs
+      - util-linux
+      - "{{ 'systemd-udev' if ansible_facts.os_family == 'RedHat' else 'udev' }}"
+    state: present
+
+- name: Read current LVM state (errors must stop provisioning)
+  ansible.builtin.command:
+    argv: "{{ item }}"
+  loop:
+    - [vgs, --reportformat, json, -o, vg_name]
+    - [lvs, --reportformat, json, -o, lv_name]
+    - [pvs, --reportformat, json, -o, pv_name]
+  register: create_disk_lvm_reports
+  changed_when: false
+
+- name: Select an unused VG and LV name
+  ansible.builtin.include_tasks: select_names.yml
+
+- name: Resolve PV aliases before comparing device names
+  ansible.builtin.command:
+    argv: [readlink, --canonicalize-existing, '--', '{{ item }}']
+  loop: '{{ create_disk_existing_pvs }}'
+  register: create_disk_canonical_pvs
+  changed_when: false
+
+- name: Include canonical paths in the protected PV list
+  ansible.builtin.set_fact:
+    create_disk_existing_pvs: >-
+      {{ create_disk_existing_pvs +
+         (create_disk_canonical_pvs.results | map(attribute='stdout') | list) }}
+
+- name: Read device usage from the kernel
+  ansible.builtin.command:
+    argv: [lsblk, --json, --paths, --output, 'NAME,TYPE,RO,MOUNTPOINTS']
+  register: create_disk_lsblk
+  changed_when: false
+
+- name: Select exactly one unused disk
+  ansible.builtin.include_tasks: select_device.yml
+
+- name: Inspect signatures without writing to disk
+  ansible.builtin.command:
+    argv: [wipefs, --no-act, --json, "{{ create_disk_selected_device }}"]
+  register: create_disk_signatures
+  changed_when: false
+
+- name: Require explicit permission to remove stale signatures
+  ansible.builtin.assert:
+    that: >-
+      create_disk_wipe_signatures or
+      (create_disk_signatures.stdout | from_json).signatures | length == 0
+    fail_msg: >-
+      {{ create_disk_selected_device }} has signatures. Investigate its contents;
+      set create_disk_wipe_signatures=true only for a confirmed disposable disk.
+
+- name: Provision the selected disk
+  ansible.builtin.include_tasks: provision.yml

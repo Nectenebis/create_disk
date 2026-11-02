@@ -1,0 +1,26 @@
+---
+- name: Parse existing names and reset selection for this invocation
+  ansible.builtin.set_fact:
+    create_disk_existing_vgs: "{{ (create_disk_lvm_reports.results[0].stdout | from_json).report[0].vg | map(attribute='vg_name') | map('trim') | list }}"
+    create_disk_existing_lvs: "{{ (create_disk_lvm_reports.results[1].stdout | from_json).report[0].lv | map(attribute='lv_name') | map('trim') | list }}"
+    create_disk_existing_pvs: "{{ (create_disk_lvm_reports.results[2].stdout | from_json).report[0].pv | map(attribute='pv_name') | map('trim') | list }}"
+    create_disk_selected_vg: ""
+    create_disk_selected_lv: ""
+
+- name: Choose the first available pair of names
+  ansible.builtin.set_fact:
+    create_disk_selected_vg: "{{ create_disk_vg_base }}{{ create_disk_suffix }}"
+    create_disk_selected_lv: "{{ create_disk_lv_base }}{{ create_disk_suffix }}"
+  vars:
+    create_disk_suffix: "{{ '' if item == 0 else '-' ~ item }}"
+  loop: "{{ range(0, (create_disk_existing_vgs | length) + (create_disk_existing_lvs | length) + 1) | list }}"
+  when:
+    - create_disk_selected_vg == ''
+    - (create_disk_vg_base ~ create_disk_suffix) not in create_disk_existing_vgs
+    - (create_disk_lv_base ~ create_disk_suffix) not in create_disk_existing_lvs
+
+- name: Verify name selection
+  ansible.builtin.assert:
+    that:
+      - create_disk_selected_vg | length > 0
+      - create_disk_selected_lv | length > 0

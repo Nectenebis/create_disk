@@ -1,0 +1,125 @@
+---
+- name: Wipe disk signatures only when explicitly permitted
+  ansible.builtin.command:
+    argv: [wipefs, --all, --force, '{{ create_disk_selected_device }}']
+  when: create_disk_wipe_signatures
+  register: create_disk_wipe
+  changed_when: create_disk_wipe.stdout | length > 0
+
+- name: Create a GPT partition for LVM
+  community.general.parted:
+    device: '{{ create_disk_selected_device }}'
+    label: gpt
+    number: 1
+    part_start: 1MiB
+    part_end: 100%
+    flags: [lvm]
+    state: present
+
+- name: Inform the kernel about the new partition
+  ansible.builtin.command:
+    argv: [partprobe, '{{ create_disk_selected_device }}']
+  changed_when: false
+
+- name: Wait for udev
+  ansible.builtin.command:
+    argv: [udevadm, settle, --timeout=30]
+  changed_when: false
+
+- name: Wait for the partition device
+  ansible.builtin.wait_for:
+    path: '{{ create_disk_selected_partition }}'
+    timeout: 30
+
+- name: Refuse a partition mounted by another service
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --source, '{{ create_disk_selected_partition }}']
+  register: create_disk_partition_mount
+  changed_when: false
+  failed_when: create_disk_partition_mount.rc != 1
+
+- name: Inspect signatures at the new partition offset
+  ansible.builtin.command:
+    argv: [wipefs, --no-act, --json, '{{ create_disk_selected_partition }}']
+  register: create_disk_partition_signatures
+  changed_when: false
+
+- name: Require permission to wipe partition signatures too
+  ansible.builtin.assert:
+    that: >-
+      create_disk_wipe_signatures or
+      (create_disk_partition_signatures.stdout | from_json).signatures | length == 0
+    fail_msg: >-
+      Old signatures were found inside the new partition. Stopping before PV creation.
+      Inspect this disk manually; it now has a partition and will not be selected automatically again.
+
+- name: Wipe partition signatures only when explicitly permitted
+  ansible.builtin.command:
+    argv: [wipefs, --all, --force, '{{ create_disk_selected_partition }}']
+  when: create_disk_wipe_signatures
+  register: create_disk_partition_wipe
+  changed_when: create_disk_partition_wipe.stdout | length > 0
+
+- name: Wait for udev after signature inspection and cleanup
+  ansible.builtin.command:
+    argv: [udevadm, settle, --timeout=30]
+  changed_when: false
+
+- name: Recheck VG names before creating the group
+  ansible.builtin.command:
+    argv: [vgs, --reportformat, json, -o, vg_name]
+  register: create_disk_final_vgs
+  changed_when: false
+
+- name: Stop if the selected VG has appeared since selection
+  ansible.builtin.assert:
+    that: >-
+      create_disk_selected_vg not in
+      ((create_disk_final_vgs.stdout | from_json).report[0].vg | map(attribute='vg_name') | map('trim') | list)
+    fail_msg: LVM state changed during provisioning. Do not run storage provisioning concurrently.
+
+- name: Create a dedicated volume group without removing any other PV
+  community.general.lvg:
+    vg: '{{ create_disk_selected_vg }}'
+    pvs: '{{ create_disk_selected_partition }}'
+    remove_extra_pvs: false
+    state: present
+
+- name: Create the logical volume using all free extents
+  community.general.lvol:
+    vg: '{{ create_disk_selected_vg }}'
+    lv: '{{ create_disk_selected_lv }}'
+    size: 100%FREE
+    shrink: false
+    state: present
+
+- name: Create XFS without forcing an existing filesystem overwrite
+  community.general.filesystem:
+    fstype: xfs
+    dev: '/dev/{{ create_disk_selected_vg }}/{{ create_disk_selected_lv }}'
+    force: false
+
+- name: Create the mount directory
+  ansible.builtin.file:
+    path: '{{ mount_point }}'
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Mount the new volume and persist it in fstab
+  ansible.posix.mount:
+    path: '{{ mount_point }}'
+    src: '/dev/{{ create_disk_selected_vg }}/{{ create_disk_selected_lv }}'
+    fstype: xfs
+    opts: defaults
+    state: mounted
+
+- name: Report the created volume
+  ansible.builtin.set_fact:
+    create_disk_result:
+      device: '{{ create_disk_selected_device }}'
+      partition: '{{ create_disk_selected_partition }}'
+      vg: '{{ create_disk_selected_vg }}'
+      lv: '{{ create_disk_selected_lv }}'
+      mount_point: '{{ mount_point }}'
